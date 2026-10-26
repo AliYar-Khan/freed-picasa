@@ -1,0 +1,9 @@
+/re/
+/build/
+/third_party/_fetch/
+.clangd
+.cache/
+/tools/
+imgui.ini
+picasa-3-9-141-259.exe
+*.exe
