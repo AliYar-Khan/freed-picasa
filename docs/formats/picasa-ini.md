@@ -67,39 +67,94 @@ Key mapping used by open-picasa (see `src/data/picasa_ini.h` docs):
 
 | Edit op | picasa.ini key(s) | Notes |
 |---|---|---|
-| star | `star=yes` / absent | same |
-| rotation | `rotate=%d` (0..3) | pending wine verify of sign semantics |
-| crop | `crop=rect64(%I64x)` | nibble order per above |
+| star | `star=yes` / absent | **live-verified** (written by real Picasa 3.9.141) |
+| rotation | `rotate=rotate(%d)` (0..3) | **live-verified** — value is the *string* `rotate(N)`, not a bare integer. Our emitter's `rotate=%d` is ignored by real Picasa; emitter fix pending |
+| crop | `crop=rect64(%I64x)` | nibble order per above; live ground truth still needed |
 | redeye | `redeye=1;` + DB list | our tool stores circles list in ini (2-entry list) until DB format mapped |
 | retouch | `retouch=1;` + DB list | same treatment |
 | tuning | `enhancement=...` / sliders | P1 pending key verification |
+| (any edit) | `backuphash=%d` | added by Picasa with the first edit in a section (sample_0 → `backuphash=60931`). Not crc32/adler32/md5-low16/sha1-low16/byte-sum of the file (all computed, none match). Likely hash of name/size/mtime or internal token — gates section trust, see below |
 
 ## Verification status
 
-Static verification (strings/RTTI mining + unit tests in `tests/test_picasa_ini.cpp`)
-is complete for: star, crop rect64, redeye "1;", rotate integer form. A *live*
-behavioral diff under wine is currently blocked (P6):
+**Wine oracle is LIVE** (2026-10-27): real Picasa 3.9.141 runs under Steam Proton
+and is used as the behavioral reference. Setup recipe and UI map live in
+`docs/oracle-wine-setup.md`; raw traces in `re/picasa_run*.log`.
 
-- Fedora wine-core 11.0-3 fails to construct a usable prefix (`kernel32.dll`
-  c0000135 with syswow64 never populated; gstreamer deadlock workaround
-  `WINEDLLOVERRIDES="winegstreamer="` applied; headless + display boot loops).
-- Steam Proton (wine-11.0) renders the app process but the DB-init exit cycle
-  ends before a mapped window: prefix archaeology showed (a) broken relative
-  `steam.exe` symlinks outside Steam's compatdata layout, and (b) Proton
-  re-trimming/dropping symlinked builtin DLLs on every prefix upgrade. A
-  manually repaired prefix at
-  `~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/picasa_manual/pfx`
-  (arch-correct symlinks: system32→x86_64-windows, syswow64→i386-windows)
-  reached services+DB init (`AppData/Local/Google/Picasa2/db3` populated,
-  ytf font runtime written) but never mapped a main window (RPC_S_SERVER_
-  UNAVAILABLE seh unwind in the updater/automation thread; silent exit).
+### Live-verified writer format (captured byte-for-byte)
 
-Unit covered round-trips (doctest, 47 assertions):
+Real Picasa 3.9.141 was driven via UI injection (select photo → Batch Edit →
+Rotate Clockwise, then star button). The ini it wrote (`cat -A`, `^M$` = CRLF):
+
+```
+[Picasa2]^M$
+encoding=UTF-8^M$
+^M$
+[sample_1.jpg]^M$      ← foreign section we staged earlier, preserved verbatim
+star=yes^M$
+^M$
+[sample_0.jpg]^M$      ← section created by Picasa on first edit
+rotate=rotate(1)^M$
+backuphash=60931^M$
+star=yes^M$            ← appended later by the star button (key order kept)
+```
+
+Facts established:
+
+- CRLF endings; `[Picasa2]` + `encoding=UTF-8` header; sections named with the
+  exact filename; new sections appended in edit order; writer merges/keeps
+  unknown keys and foreign sections.
+- **Rotation value syntax is `rotate=rotate(1)`** — the parsed value is the
+  string `rotate(N)` (matches mined `rotate(%d)` format string). A bare
+  `rotate=1` is silently ignored by the reader.
+- `backuphash=<int>` is written with the first edit in a section. Value for
+  sample_0.jpg (70144 B) is 60931 — no match against crc32/adler32 low/high16,
+  md5/sha1 low16, or byte-sum%65536 of the file content. TBD.
+- **Section trust gate**: our staged `[sample_1.jpg] star=yes` (no backuphash)
+  was *preserved verbatim* by Picasa's writer, but was *never applied* —
+  thumbnail showed no star badge and no rotation across multiple fresh-DB
+  restarts, while Picasa-edited sections (with backuphash) applied instantly.
+  Strong hypothesis: the reader requires a valid per-section hash (backuphash
+  or equivalent) before trusting any edit state in that section. TO VERIFY:
+  stage `rotate=rotate(1)` + correct `backuphash` and restart with fresh DB.
+
+### Scan-time ini behavior (WINEDEBUG=+file trace)
+
+- Scanner thread enumerates the folder, lists `picasa.ini` as a dir entry.
+- Probes `.picasa.ini` (dot variant) with GetFileAttributesW (we didn't create
+  one — unknown whether it takes precedence).
+- Opens `picasa.ini` GENERIC_READ and reads the **full file** repeatedly
+  (6× during a 4-image folder scan — looks like per-image re-parse).
+- With an untrusted ini present, the scan still completes and commits the DB
+  (db3/*.pmp written ~5 min after launch; ioqueue holds earlier writes) — but
+  no edit state is applied.
+
+### db3 PMP artifacts (live-dumped)
+
+- PMP header starts with float32 `1.0` (`cd cc cc 3f`) + u16 count + tag
+  `32 13` (`0x1332`), then per-record blocks; see `docs/reference`.
+- `imagedata_height.pmp` / `imagedata_width.pmp`: per-image u32 (900/1200).
+- `imagedata_edit_height.pmp` / `imagedata_edit_width.pmp`: same layout,
+  zeros (unedited images); presumably updates on edit.
+- `imagedata_originfast.pmp`: per-image u32 content fingerprint
+  (sample_3 → 0x0cf6ea35); zeros until first processed. Candidate source for
+  backuphash/token comparisons.
+- `starlist.txt`, `tags.txt`, `saverlist.txt`: empty until starred/tagged.
+
+### Static verification (unit tests, doctest — 47 assertions)
+
 - `IniFile::load/save/set/remove_key` preserves unknown keys verbatim.
 - `rect64_encode` == `00000000ffffffff` for full-frame; clamps; 16 hex chars.
-- `set_crop/set_redeye/set_rotate/set_star` emit the mined key formats with
-  unknown keys retained in same section.
+- `set_crop/set_redeye/set_star` emit the mined key formats with unknown keys
+  retained in same section. `set_rotate` emits the WRONG form (`rotate=%d`);
+  must be changed to `rotate=rotate(%d)` — #1 next step.
 
-Remaining when wine becomes usable on this machine: run a star/rotate/crop
-round-trip in Picasa3.exe, diff its `picasa.ini` output key-by-key against
-ours, and confirm the rotation sign semantics + tuning key names.
+### Open items for the ini round-trip
+
+1. Fix `set_rotate` to `rotate=rotate(N)`; re-run smoke/unit.
+2. Crack `backuphash` (collect ≥2 data points: edit a second file, re-edit
+   the same file, check invariance vs file bytes vs path/mtime).
+3. Verify staged sections WITH backuphash are applied on fresh-DB restart.
+4. Capture crop + redeye ground truth via the edit-view tools (drag needs
+   press/rel subcommands in xctl).
+5. Check `.picasa.ini` dot-variant precedence.
